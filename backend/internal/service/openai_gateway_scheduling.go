@@ -1243,15 +1243,25 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 							return markStickySessionHit(selection, true), nil
 						}
 
-						waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
-						if waitingCount < cfg.StickySessionMaxWaiting {
-							selection, selectErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
-								AccountID:      accountID,
-								MaxConcurrency: account.Concurrency,
-								Timeout:        cfg.StickySessionWaitTimeout,
-								MaxWaiting:     cfg.StickySessionMaxWaiting,
-							})
-							return markStickySessionHit(selection, true), selectErr
+						// 粘性账号槽位已满：在调度器内最多等待 cfg.StickySessionWaitTimeout，
+						// 期间周期性重试抢槽位；超时后置 stickySpillover，继续走 Layer 2
+						// 选择其他账号（如 plus 号），而不是退回上层等待并最终返回 429。
+						waitDeadline := time.Now().Add(cfg.StickySessionWaitTimeout)
+						for time.Now().Before(waitDeadline) {
+							select {
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							case <-time.After(200 * time.Millisecond):
+							}
+							retryResult, retryErr := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+							if retryErr == nil && retryResult != nil && retryResult.Acquired {
+								selection, selectErr := s.newAcquiredSelectionResult(ctx, account, retryResult.ReleaseFunc)
+								if selectErr != nil {
+									return nil, selectErr
+								}
+								_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
+								return markStickySessionHit(selection, true), nil
+							}
 						}
 						stickySpillover = true
 					}
